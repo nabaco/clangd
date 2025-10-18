@@ -1,0 +1,148 @@
+diff --git a/clang-tools-extra/clangd/tool/ClangdMain.cpp b/clang-tools-extra/clangd/tool/ClangdMain.cpp
+index 4a990f8f7..54d02c4b6 100644
+--- a/clang-tools-extra/clangd/tool/ClangdMain.cpp
++++ b/clang-tools-extra/clangd/tool/ClangdMain.cpp
+@@ -14,6 +14,7 @@
+ #include "ConfigProvider.h"
+ #include "Feature.h"
+ #include "FeatureModule.h"
++#include "GlobalCompilationDatabase.h"
+ #include "IncludeCleaner.h"
+ #include "PathMapping.h"
+ #include "Protocol.h"
+@@ -68,6 +69,11 @@ namespace clangd {
+ bool check(const llvm::StringRef File, const ThreadsafeFS &TFS,
+            const ClangdLSPServer::Options &Opts);
+ 
++// Index project files and write background index shards to disk.
++bool indexProject(llvm::StringRef ProjectPath, const ThreadsafeFS &TFS,
++                  const GlobalCompilationDatabase &CDB, unsigned ThreadPoolSize,
++                  llvm::ThreadPriority IndexingPriority);
++
+ namespace {
+ 
+ using llvm::cl::cat;
+@@ -394,6 +400,17 @@ opt<Path> CheckFile{
+     ValueOptional,
+ };
+ 
++opt<Path> IndexProject{
++    "index-project",
++    cat(Misc),
++    desc("Index the project and write shards without starting an LSP server. "
++         "Useful for pre-building background index in offline scenarios. "
++         "With --index-project[=<path>], indexes all files in compile_commands.json. "
++         "Path defaults to current directory if not specified."),
++    init(""),
++    ValueOptional,
++};
++
+ enum PCHStorageFlag { Disk, Memory };
+ opt<PCHStorageFlag> PCHStorage{
+     "pch-storage",
+@@ -740,6 +757,68 @@ public:
+ };
+ } // namespace
+ 
++bool indexProject(llvm::StringRef ProjectPath, const ThreadsafeFS &TFS,
++                  const GlobalCompilationDatabase &CDB, unsigned ThreadPoolSize,
++                  llvm::ThreadPriority IndexingPriority) {
++  trace::Span Tracer("IndexProject");
++  log("Indexing project at {0}", ProjectPath);
++  
++  // Get the compilation database for the project
++  // We need to load compile_commands.json to get all files
++  std::string DatabaseLoadErrorMessage;
++  std::unique_ptr<tooling::CompilationDatabase> CompileDB =
++      tooling::CompilationDatabase::autoDetectFromDirectory(
++          ProjectPath, DatabaseLoadErrorMessage);
++  
++  if (!CompileDB) {
++    elog("Failed to load compilation database from {0}: {1}",
++         ProjectPath, DatabaseLoadErrorMessage);
++    return false;
++  }
++  
++  // Get all files from the compilation database
++  auto AllFiles = CompileDB->getAllFiles();
++  if (AllFiles.empty()) {
++    elog("No files found in compilation database");
++    return false;
++  }
++  
++  log("Found {0} files to index", AllFiles.size());
++  
++  // Create a BackgroundIndex to index all files
++  BackgroundIndex::Options BGOpts;
++  BGOpts.ThreadPoolSize = std::max(ThreadPoolSize, 1u);
++  BGOpts.IndexingPriority = IndexingPriority;
++  
++  // Progress callback to show indexing progress
++  BGOpts.OnProgress = [](BackgroundQueue::Stats S) {
++    if (S.Completed % 10 == 0 || S.Completed == S.Enqueued) {
++      log("Indexed {0}/{1} files", S.Completed, S.Enqueued);
++    }
++  };
++  
++  // Create storage factory for disk-backed index shards
++  auto IndexStorageFactory = BackgroundIndexStorage::createDiskBackedStorageFactory(
++      [&CDB](PathRef File) { return CDB.getProjectInfo(File); });
++  
++  // Create the background index
++  auto BgIndex = std::make_unique<BackgroundIndex>(
++      TFS, CDB, std::move(IndexStorageFactory), std::move(BGOpts));
++  
++  // Enqueue all files for indexing
++  BgIndex->enqueue(AllFiles);
++  
++  // Wait for indexing to complete
++  log("Waiting for indexing to complete...");
++  if (!BgIndex->blockUntilIdleForTest(/*TimeoutSeconds=*/std::nullopt)) {
++    elog("Indexing did not complete");
++    return false;
++  }
++  
++  log("Indexing completed successfully");
++  return true;
++}
++
+ enum class ErrorResultCode : int {
+   NoShutdownRequest = 1,
+   CantRunAsXPCService = 2,
+@@ -1018,6 +1097,36 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
+                : static_cast<int>(ErrorResultCode::CheckFailed);
+   }
+ 
++  if (IndexProject.getNumOccurrences()) {
++    llvm::SmallString<256> Path;
++    if (IndexProject.empty()) {
++      // Default to current directory
++      if (auto Error = llvm::sys::fs::current_path(Path)) {
++        elog("Failed to get current directory: {0}", Error.message());
++        return 1;
++      }
++    } else {
++      if (auto Error =
++              llvm::sys::fs::real_path(IndexProject, Path, /*expand_tilde=*/true)) {
++        elog("Failed to resolve path {0}: {1}", IndexProject, Error.message());
++        return 1;
++      }
++    }
++    log("Entering index project mode (no LSP server)");
++    log("Project path: {0}", Path);
++    
++    // Create compilation database
++    DirectoryBasedGlobalCompilationDatabase::Options CDBOpts(TFS);
++    CDBOpts.CompileCommandsDir = CompileCommandsDir;
++    auto CDB = std::make_unique<DirectoryBasedGlobalCompilationDatabase>(
++        CDBOpts);
++    
++    return indexProject(Path, TFS, *CDB, WorkerThreadsCount,
++                       BackgroundIndexPriority)
++               ? 0
++               : static_cast<int>(ErrorResultCode::CheckFailed);
++  }
++
+   FeatureModuleSet ModuleSet = FeatureModuleSet::fromRegistry();
+   if (ModuleSet.begin() != ModuleSet.end())
+     Opts.FeatureModules = &ModuleSet;
